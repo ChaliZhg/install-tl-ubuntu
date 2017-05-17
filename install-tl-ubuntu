@@ -52,7 +52,7 @@ fi
 ERRORPREFIX="${ECHOPREFIX}ERROR: "
 WARNINGPREFIX="${ECHOPREFIX}WARNING: "
 
-ARGS=$( getopt -o "r:mt:u:hvaebo:fgq:p:i:" -l "retry:,more-tex,truetype-dir:,usr-fonts-dir:,help,version,allow-small,hebrew,no-link-ubuntu,log-dir:,only-apt-and-dpkg,no-apt-or-dpkg,repository:,profile:,iso:" \
+ARGS=$( getopt -o "r:mt:u:hvaebo:fgq:p:i:s" -l "retry:,more-tex,truetype-dir:,usr-fonts-dir:,help,version,allow-small,hebrew,no-link-ubuntu,log-dir:,only-apt-and-dpkg,no-apt-or-dpkg,repository:,profile:,iso:,pretest" \
       -n "$( basename "$0" )" -- "$@" )
 # If bad arguments, exit (getopt will have already written the error to STDERR).
 [ "$?" = "0" ] || clean_error
@@ -75,6 +75,7 @@ ISO_FILE=
 ONLY_APT_DPKG=0
 NO_APT_DPKG=0
 LOG_DIR="${MAINDIR}"
+PRETEST=0
 
 while true
 do
@@ -139,6 +140,9 @@ do
       fi
       shift 2
       ;;
+  -s|--pretest)  PRETEST=1
+      shift 1
+      ;;
   -t|--truetype-dir)
       if [ -d "$2" ]; then
         TT_FONTS="$( readlink -f "$2" )"
@@ -184,9 +188,9 @@ if [ "${HELP}" = "1" ]; then
   DESCRIPTION
   Warning: this script has barely been tested except by the author.
 
-  This script uses the TeX Live 2013 installer to install TeX Live so that LaTeX
+  This script uses the TeX Live 2014 installer to install TeX Live so that LaTeX
   packages can be updated through CTAN with tlmgr. To do this, the official TeX
-  Live 2013 installer is downloaded and used and apt is informed that TeX
+  Live 2014 installer is downloaded and used and apt is informed that TeX
   dependencies are satisfied. Thus, when you want to install a program with
   apt-get that depends on TeX Live, apt will not try to install the TeX Live
   packages from the Ubuntu repositories.
@@ -242,12 +246,16 @@ if [ "${HELP}" = "1" ]; then
                                 that you might need to manually edit the Debian control file so that
                                 apt does not think that you have a full TeX Live installation.          \e[00m
   -q, --repository REPO      \e[00;36m Use the specified repository to download and run installer.
-                                If this option is not specified, the fastest server will be determined
+                                If this option is not specified, the fastest repo will be determined
                                 automatically. This option can be used to determine which version of
-                                TeX Live is installed (e.g. 2012, 2013, pretest).                       \e[00m
+                                TeX Live is installed (e.g. 2013, 2014, pretest). If it is a pretest
+                                repository, please also specify the --pretest option.                   \e[00m
   -r, --retry                \e[00;36m Number of times to retry if install-tl fails to install
                                 and for wget (used to download install-tl and if --hebrew or --more-tex
                                 is specified). The default is 5.                                        \e[00m
+  -s, --pretest              \e[00;36m Install the TeX Live pretest instead of the stable version.
+                                If --repository is not specified, the fastest pretesting repo will
+                                be detected and used.                                                   \e[00m
   -t DIR, --truetype-dir DIR \e[00;36m Directory containing TrueType fonts to be installed
                                 (e.g. to be used by pdfTeX).                                            \e[00m
   -u DIR, --usr-fonts-dir DIR\e[00;36m Directory containing fonts to be installed in /usr/share/fonts/
@@ -327,7 +335,7 @@ function checkEnvVars ()
 ### /end function declarations
 
 if [ "${VERSION}" = "1" ]; then
-  echo -e "\\ninstall-tl-ubuntu\\nVersion 0.4.1\\nAuthor: Scott Kostyshak\\nContact: skostysh@princeton.edu"
+  echo -e "\\ninstall-tl-ubuntu\\nVersion 0.5\\nAuthor: Scott Kostyshak\\nContact: skostysh@princeton.edu\\n"
   exit 0
 fi
 
@@ -395,16 +403,75 @@ if [ "${NO_APT_DPKG}" != "1" ]; then
     #      and upstream bug:
     #      http://bugs.debian.org/cgi-bin/bugreport.cgi?bug=679101
     CONTROL_OUTD=$( mktemp -d )
+    # FIXME work on this
     if [ "${VER_UBUNTU}" != "12.04" ]; then
         sed -r 's/latex-cjk-xcjk,? ?//g' "debian-control-texlive-in.txt" |
             sed -r 's/texlive-lang-ukenglish,? ?//g' > "${CONTROL_OUTD}/debian-control-texlive-out.txt"
     else
             cp "debian-control-texlive-in.txt" "${CONTROL_OUTD}/debian-control-texlive-out.txt"
     fi
-    ( cd "${CONTROL_OUTD}" && equivs-build "debian-control-texlive-out.txt" ) >&3 2>&1 \
-        || echo "${WARNINGPREFIX}equivs-build failed for TeX Live" >&2
-    dpkg -i "${CONTROL_OUTD}/texlive-local_2013-1~9_all.deb" >&3 2>&1 || \
-        echo "${WARNINGPREFIX}dpkg could not install dummy TeX Live package" >&2
+    cp "debian-control-template.txt" "${CONTROL_OUTD}"/
+    (
+      echo "CONTROL_OUTD is: ${CONTROL_OUTD}"
+          # TODO condition on parallel
+          # TODO eventually make parallel a requirement, when 12.04 reaches end of support.
+          cd "${CONTROL_OUTD}" &&
+          packageNames=( $(grep -P -o "\S*," debian-control-texlive-out.txt | sed 's/,//') )
+
+      # note that version could be none or NULL:
+      # ah, but thats only if I installed a dummy with empty version?
+      # scott@scott:~/Desktop/install_tl_DEBUG$ apt-cache policy biblatex
+      # biblatex:
+      #   Installed: (none)
+      #   Candidate: (none)
+      #   Version table:
+      # scott@scott:~/Desktop/install_tl_DEBUG$ apt-cache policy biblatexyz
+      # N: Unable to locate package biblatexyz
+      # scott@scott:~/Desktop/install_tl_DEBUG$
+
+
+
+      dummyNames=()
+      for pack in "${packageNames[@]}"; do
+          # 'apt-cache show' gives non-zero exit code when package does not exist.
+          # 'apt-cache policy' does not
+          # I prefer to use exit codes and not to parse apt-cache policy, although
+          # if I did we would not have to use both 'apt-cache show' and 'dpkg -s'
+          # if package not in ubuntu repos, not installing because higher chance of false conflicts with little gain
+          # We install a dummy if the package is not already installed and if is in at least one repo
+          echo "looking at package ${pack}..."
+          if dpkg -s "${pack}" > /dev/null 2>&1; then
+            echo "NOTE: ${pack} is already installed. This could be duplicated space because TeX Live provides this package."
+          else
+            if ! apt-cache show "${pack}" > /dev/null 2>&1; then
+              echo "NOTE: ${pack} is not in one of your repositories so no need for equivs to fake it."
+            else
+              #TODO if not PARALLEL, do equivs here.
+              pack_v="$(apt-cache policy "${pack}" | head -n 3 | tail -n 1 | sed "s/.*Candidate: //")"
+              if [ "${pack_v}" = "(none)" ]; then
+                # package might be virtual. e.g. texlive-common ttf-gfs-artemisia
+                # I tried pack_v=9999. That didnt work too well. If uncomment below, take dummyNames out of else.
+		# pack_v=9999
+                echo "NOTE: ${pack} is virtual. It's best not to install a dummy."
+              else
+                dummyNames+=("${pack}")
+              fi
+              #TODO sanity check pack_v ? if apt-cache shows it, there should be a version right?
+              cat "debian-control-template.txt" | sed -e "s/replaceme1919/${pack}/g" -e "s/9876/${pack_v}/" > "${pack}"
+            fi
+          fi
+      done
+          echo "going to install the following dummy packages: ${dummyNames[@]}"
+          parallel --gnu 'equivs-build "{}"' ::: ${dummyNames[@]}
+          # FIXME if not in Ubuntu repo no point in equiving it and could be bad (could be listed in replaced or breaks fields of a package)
+          # FIXME remove packages with empty versions
+    ) >&3 2>&1 \
+        || echo "${WARNINGPREFIX}equivs-builds failed for TeX Live dummies" >&2
+
+
+
+    dpkg -i "${CONTROL_OUTD}"/*.deb >&3 2>&1 || \
+        echo "${WARNINGPREFIX}dpkg could not install TeX Live dummies" >&2
     if [ "${ONLY_APT_DPKG}" = 1 ]; then
         clean_up
         exit 0
@@ -415,15 +482,25 @@ if [ -z "${TLREPO:-}" -a -z "${ISO_FILE}" ]; then
     echo "${ECHOPREFIX}determining the fastest repository..."
     CURR_DIR="$( pwd )"
     cd "$( mktemp -d )"
-    testPath='indexing/forindex.zip'
+    if [ "${PRETEST}" = "0" ]; then
+        testPath='indexing/forindex.zip'
+    else
+        testPath='install-tl'
+    fi
 
     # We skip ftp connections.
     # We only try every third server. The servers are listed in geographic
     # order so this should pick up a little of everything.
-    wget --quiet -O - "http://ctan.org/mirrors" \
-      | grep -o "http.*>http<" \
-      | sed -n 1~3p \
-      | sed 's/">http<//' > "candidates.txt"
+    if [ "${PRETEST}" = "0" ]; then
+      wget --quiet -O - "http://ctan.org/mirrors" \
+        | grep -o "http.*>http<" \
+        | sed -n 1~3p \
+        | sed 's/">http<//' > "candidates.txt"
+    else
+      wget --quiet -O - "https://www.tug.org/texlive/mirmon/" \
+        | grep -oP "HREF=\"http.*pretest/" \
+        | sed 's/HREF=\"//' > "candidates.txt"
+    fi
 
     # Note that if there is a timeout the repo does not get an entry in mirrorWgets.log.
     sed 's#$#'${testPath}'#' "candidates.txt" \
@@ -436,7 +513,11 @@ if [ -z "${TLREPO:-}" -a -z "${ISO_FILE}" ]; then
       echo "${ECHOPREFIX}the fastest repo is: ${TLREPO}"
     else
       echo "${ECHOPREFIX}trying automatic detection with a longer timeout and smaller file..."
-      testPath='systems/knuth/local/tex/Makefile'
+      if [ "${PRETEST}" = "0" ]; then
+          testPath='systems/knuth/local/tex/Makefile'
+      else
+          testPath='install-tl.zip.sha256'
+      fi
       sed 's#$#'${testPath}'#' "candidates.txt" \
       | parallel --gnu --jobs 3 --timeout 60 '/usr/bin/time -f "%x %e %C" wget --quiet' > "${LOG_DIR}/mirrorWgets.log" 2>&1
       grep "^0" "${LOG_DIR}/mirrorWgets.log" | sort -n -k2 > "${LOG_DIR}/mirrorCandidates.log"
@@ -444,7 +525,11 @@ if [ -z "${TLREPO:-}" -a -z "${ISO_FILE}" ]; then
       if [ -n "${TLREPO}" ]; then
         echo "${ECHOPREFIX}the fastest repo is: ${TLREPO}"
       else
-        TLREPO='http://mirror.utexas.edu/ctan/'
+        if [ "${PRETEST}" = "0" ]; then
+          TLREPO='http://mirror.utexas.edu/ctan/'
+        else
+          TLREPO='http://mirror.hmc.edu/tlpretest/'
+        fi
         echo -e "${WARNINGPREFIX}automatic repo detection failed. We will use the default repo:\n  ${TLREPO}" >&2
       fi
     fi
@@ -464,7 +549,11 @@ if [ -n "${ISO_FILE}" ]; then
     fi
 else
 (
-    TLINSTALLER="${TLREPO}/systems/texlive/tlnet/install-tl-unx.tar.gz"
+    if [ "${PRETEST}" = "0" ]; then
+        TLINSTALLER="${TLREPO}/systems/texlive/tlnet/install-tl-unx.tar.gz"
+    else
+        TLINSTALLER="${TLREPO}/install-tl-unx.tar.gz"
+    fi
     timesToTry=$(( TIMESRETRY + 1 ))
     timesTried=0
     fail=0
@@ -579,7 +668,7 @@ while (( timesTried != timesToTry )); do
         if ( grep -i "are not compatible" "${TLlog}" &&
              grep -i "Perhaps you need to use a different CTAN mirror?" "${TLlog}" ) > /dev/null 2>&1; then
                echo -e ${ECHOPREFIX}the installer and repo are mismatched.\
-                       \\nFor example, the installer could be for TeX Live 2013 and the repo for 2012. >&2
+                       \\nFor example, the installer could be for TeX Live 2014 and the repo for 2013. >&2
                clean_error
         fi
         (( timesTried != timesToTry )) && echo "${ECHOPREFIX}we will try to restart the install." >&2
@@ -738,8 +827,11 @@ if [ "${EXTRAS}" = "1" ]; then
     # aa-package.tar.gz contains an old version of natbib that will be used if not removed
     rm "aa-package/bibtex/natbib.sty" ||
       { echo "${WARNINGPREFIX}aa-package's bundled natbib could not be removed"; MAINRET=1; }
+    # TODO contact AA and AEA maintainers and see if they can zip the files differently.
     # aa.cls is not readable when extracted. Might as well do for all.
     chmod -R +r * || { echo "${WARNINGPREFIX}chmod failed to set read permission on files." >&2; MAINRET=1; }
+    # AEA directory has strange permissions. Might as well correct for all directories.
+    find ./ -type d -exec chmod 0755 '{}' \;
 
     # AEA files are all executable. That can't lead to any good. Might as well do for all. (but not folders)
     find ./ -type f -exec chmod -x '{}' \;
